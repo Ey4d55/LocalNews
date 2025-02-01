@@ -1,0 +1,274 @@
+import os
+import re
+import asyncio
+import requests
+import logging
+import json
+from solders.keypair import Keypair
+from solana.rpc.async_api import AsyncClient
+from solders.transaction import Transaction
+import tweepy
+import asyncio
+
+# ===== CONFIGURATION =====
+SOLANA_RPC = "https://api.devnet.solana.com"  # Use Devnet for testing (switch to Mainnet later)
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")  # Store in environment variable
+TRACKED_ACCOUNTS = ["EY4DZz"]  # Trusted low-rug accounts
+MAX_SOL_PER_TRADE = 0.1  # $0.40 per trade (at $20/SOL)
+MAX_TOTAL_SOL = 0.1  # $2 total risk
+GAS_FEE_BUFFER = 0.005  # Buffer for Solana transaction fees (~$0.02 at $20/SOL)
+PERSISTENCE_FILE = "bot_state.json"  # File to persist bot state
+# =========================
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+
+# Load wallet
+wallet = Keypair.from_json(open("burner.json").read())
+solana_client = AsyncClient(SOLANA_RPC)
+
+# Initialize bot state
+if os.path.exists(PERSISTENCE_FILE):
+    with open(PERSISTENCE_FILE, "r") as f:
+        bot_state = json.load(f)
+else:
+    bot_state = {"total_spent": 0.0, "purchased_tokens": {}}
+
+total_spent = bot_state["total_spent"]
+purchased_tokens = bot_state["purchased_tokens"]
+
+async def save_bot_state():
+    """Save bot state to a file."""
+    bot_state["total_spent"] = total_spent
+    bot_state["purchased_tokens"] = purchased_tokens
+    with open(PERSISTENCE_FILE, "w") as f:
+        json.dump(bot_state, f)
+
+async def get_sol_price():
+    """Fetch the current price of SOL in USD."""
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+        response = requests.get(url).json()
+        return response["solana"]["usd"]
+    except Exception as e:
+        logging.error(f"Failed to fetch SOL price: {str(e)}")
+        return 20.0  # Default to $20 if API fails
+
+async def get_token_balance(token_mint: str):
+    """Get the balance of a specific token in the wallet."""
+    try:
+        response = await solana_client.get_token_accounts_by_owner(
+            wallet.pubkey(),
+            encoding="jsonParsed",
+            mint=token_mint
+        )
+        if response['result']['value']:
+            return float(response['result']['value'][0]['account']['data']['parsed']['info']['tokenAmount']['uiAmount'])
+        return 0.0
+    except Exception as e:
+        logging.error(f"Failed to get token balance: {str(e)}")
+        return 0.0
+
+def get_token_price(contract: str):
+    """Get the current price of the token in SOL."""
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
+        response = requests.get(url, timeout=5).json()
+        price_usd = float(response["pairs"][0]["priceUsd"])
+        sol_price = asyncio.run(get_sol_price())
+        return price_usd / sol_price
+    except Exception as e:
+        logging.error(f"Failed to get token price: {str(e)}")
+        return 0.0
+
+async def swap_sol_to_token(contract: str, sol_amount: float):
+    global total_spent
+    try:
+        # Step 1: Get swap quote from Jupiter
+        quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint={contract}&amount={int(sol_amount * 1e9)}&slippageBps=2000"
+        quote = requests.get(quote_url).json()
+
+        if not quote.get("inAmount"):
+            logging.error("Invalid quote")
+            return False
+
+        # Step 2: Build transaction
+        tx_url = "https://quote-api.jup.ag/v6/swap"
+        tx_data = requests.post(tx_url, json={
+            "quoteResponse": quote,
+            "userPublicKey": str(wallet.pubkey()),
+            "wrapUnwrapSOL": True,
+        }).json()
+
+        # Step 3: Send transaction
+        tx = Transaction.deserialize(bytes.fromhex(tx_data["swapTransaction"]))
+        tx.sign(wallet)
+        result = await solana_client.send_transaction(tx)
+        if not result.value:
+            raise Exception("Transaction failed")
+
+        total_spent += sol_amount
+        purchased_tokens[contract] = {
+            'initial_investment': sol_amount,
+            'current_profit': 0.0
+        }
+        await save_bot_state()
+        logging.info(f"✅ Bought {sol_amount} SOL of {contract}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Failed: {str(e)}")
+        return False
+
+async def sell_token(contract: str, sol_value_to_sell: float):
+    """Sell tokens equivalent to a specific SOL value."""
+    try:
+        token_balance = await get_token_balance(contract)
+        token_price = get_token_price(contract)
+        if token_price == 0:
+            logging.warning(f"Token price is zero for contract {contract}, cannot sell.")
+            return False
+
+        # Calculate the amount of tokens to sell based on the desired SOL value
+        amount_to_sell = sol_value_to_sell / token_price
+        if amount_to_sell > token_balance:
+            amount_to_sell = token_balance  # Sell all tokens if we don't have enough
+
+        if amount_to_sell <= 0:
+            logging.warning(f"No tokens to sell for contract {contract}")
+            return False
+
+        # Step 1: Get swap quote from Jupiter
+        quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={contract}&outputMint=So11111111111111111111111111111111111111112&amount={int(amount_to_sell * 1e9)}&slippageBps=2000"
+        quote = requests.get(quote_url).json()
+
+        if not quote.get("inAmount"):
+            logging.error("Invalid quote")
+            return False
+
+        # Step 2: Build transaction
+        tx_url = "https://quote-api.jup.ag/v6/swap"
+        tx_data = requests.post(tx_url, json={
+            "quoteResponse": quote,
+            "userPublicKey": str(wallet.pubkey()),
+            "wrapUnwrapSOL": True,
+        }).json()
+
+        # Step 3: Send transaction
+        tx = Transaction.deserialize(bytes.fromhex(tx_data["swapTransaction"]))
+        tx.sign(wallet)
+        result = await solana_client.send_transaction(tx)
+        if not result.value:
+            raise Exception("Transaction failed")
+
+        logging.info(f"✅ Sold tokens worth {sol_value_to_sell:.4f} SOL for contract {contract}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Failed to sell token: {str(e)}")
+        return False
+
+async def check_profit_and_sell():
+    """Check profits and execute profit-taking strategy."""
+    for contract, data in purchased_tokens.items():
+        try:
+            token_balance = await get_token_balance(contract)
+            token_price = get_token_price(contract)
+            current_value = token_balance * token_price
+            initial_investment = data['initial_investment']
+            profit_percentage = (current_value - initial_investment) / initial_investment * 100
+
+            if profit_percentage >= 100 and 'initial_taken' not in data:
+                # Take out initial investment
+                await sell_token(contract, initial_investment)
+                data['initial_taken'] = True
+                logging.info(f"Initial investment recovered for {contract}")
+
+            if profit_percentage >= 150 and 'first_profit_taken' not in data:
+                # Take out 25% of remaining SOL value
+                await sell_token(contract, 0.25 * (current_value - initial_investment))
+                data['first_profit_taken'] = True
+                logging.info(f"First 25% profit taken for {contract}")
+
+            if profit_percentage >= 200 and 'second_profit_taken' not in data:
+                # Take out another 25% of remaining SOL value
+                await sell_token(contract, 0.25 * (current_value - initial_investment))
+                data['second_profit_taken'] = True
+                logging.info(f"Second 25% profit taken for {contract}")
+
+            if profit_percentage >= 300 and 'third_profit_taken' not in data:
+                # Take out another 25% of remaining SOL value
+                await sell_token(contract, 0.25 * (current_value - initial_investment))
+                data['third_profit_taken'] = True
+                logging.info(f"Third 25% profit taken for {contract}")
+
+            if profit_percentage >= 500 and 'final_profit_taken' not in data:
+                # Take out 50% of remaining SOL value
+                await sell_token(contract, 0.5 * (current_value - initial_investment))
+                data['final_profit_taken'] = True
+                logging.info(f"Final 50% profit taken for {contract}")
+        except Exception as e:
+            logging.error(f"Error checking profit for {contract}: {str(e)}")
+
+class Sniper(tweepy.StreamingClient):
+    def on_tweet(self, tweet):
+        asyncio.run(self.process_tweet(tweet.text))
+
+    async def process_tweet(self, text: str):
+        logging.info(f"Received tweet: {text}")
+
+        # Extract Solana contract address
+        contracts = re.findall(r"\b[1-9A-HJ-NP-Za-km-z]{44}\b", text)
+        for contract in contracts:
+            if self.is_contract_valid(contract):
+                amount = min(MAX_SOL_PER_TRADE, MAX_TOTAL_SOL - total_spent - GAS_FEE_BUFFER)
+                if await swap_sol_to_token(contract, amount):
+                    logging.info(f"Total spent: {total_spent:.2f} SOL")
+
+    def is_contract_valid(self, contract: str):
+        try:
+            # Check liquidity via DexScreener (free API)
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{contract}"
+            response = requests.get(url, timeout=5).json()
+            liquidity = float(response["pairs"][0]["liquidity"]["usd"])
+            return liquidity > 100  # Skip tokens with <$100 liquidity
+        except:
+            return False
+
+async def main():
+    try:
+        # Initialize the Twitter streaming client
+        bot = Sniper(os.getenv("TWITTER_BEARER_TOKEN"))
+
+        # Add rules to track tweets from the specified accounts
+        for account in TRACKED_ACCOUNTS:
+            bot.add_rules(tweepy.StreamRule(f"from:{account}"))
+
+        # Start the Twitter stream in a separate task
+        asyncio.create_task(bot.filter())
+
+        # Periodically check profits and sell tokens
+        while True:
+            await check_profit_and_sell()
+            await asyncio.sleep(60)  # Check every minute
+
+    except Exception as e:
+        logging.error(f"Bot stopped due to an error: {str(e)}")
+
+# Entry point of the script
+if __name__ == "__main__":
+    asyncio.run(main())act}"
+            response = requests.get(url, timeout=5).json()
+            liquidity = float(response["pairs"][0]["liquidity"]["usd"])
+            return liquidity > 100  # Skip tokens with <$100 liquidity
+        except:
+            return False
+
+async def main():
+    try:
+        # Initialize the Twitter streaming client
+        bot = Sniper(os.getenv("TWITTER_BEARER_TOKEN"))
+
+        # Add rules to track tweets from the specified accounts
+        for account in TRACKED_ACCOUNTS:
+            bot.add_rules(tweepy.StreamRule(f"from:{account}"))
+
+        # Start the Twitter stream in 
